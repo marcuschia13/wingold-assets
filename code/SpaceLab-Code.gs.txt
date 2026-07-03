@@ -1,0 +1,369 @@
+/**
+ * Space Lab "Fruity Adventure" — Apps Script backend
+ * Fork of the Little Shopper engine (~/AeonMiniGame) with Space Lab deltas:
+ *   + buying_for (self/kids/family/friend) + total_spent_rm + glass-cup GWP (>= RM50)
+ *   + wheel prizes STRAP/STICKER (physical) instead of Shopify vouchers
+ *   − no children's-age capture at all
+ *
+ * Deploy as Web App, execute as lotspace.my@gmail.com, access: Anyone.
+ * Script Properties: SPREADSHEET_ID, RECEIPTS_FOLDER_ID (sandbox vs prod = separate deployments).
+ *
+ * Invariants: server-authoritative everything; LockService atomic counter; append-only SpinLog;
+ * opaque spin ids (never encode the counter); idempotent entries AND spins (request_id);
+ * gold winner row created AT SPIN TIME (abandon-safe); PDPA enforced server-side;
+ * phone cells forced to TEXT in code (Sheets coerces "+60…" strings appended as numbers).
+ */
+
+var PROPS = PropertiesService.getScriptProperties();
+var BUYING_FOR = ['self', 'kids', 'family', 'friend'];
+
+function ss_() { return SpreadsheetApp.openById(PROPS.getProperty('SPREADSHEET_ID')); }
+
+function sheet_(name) {
+  var sh = ss_().getSheetByName(name);
+  if (!sh) throw new Error('Missing sheet tab: ' + name);
+  return sh;
+}
+
+function config_() {
+  var rows = sheet_('Config').getDataRange().getValues();
+  var cfg = {};
+  for (var i = 1; i < rows.length; i++) {
+    if (rows[i][0]) cfg[String(rows[i][0]).trim()] = String(rows[i][1]).trim();
+  }
+  cfg.milestones = (cfg.milestones || '').split(',').map(function (x) { return parseInt(x, 10); }).filter(Boolean);
+  cfg.outlets = (cfg.outlet_list || '').split('|').map(function (s) { return s.trim(); }).filter(Boolean);
+  cfg.testMode = String(cfg.test_mode).toUpperCase() === 'TRUE';
+  return cfg;
+}
+
+function json_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ---------------------------------------------------------------- routing
+
+function doGet(e) {
+  var action = (e && e.parameter && e.parameter.action) || 'health';
+  try {
+    if (action === 'health') return json_({ ok: true, ts: new Date().toISOString() });
+    if (action === 'getConfig') return json_(publicConfig_());
+    if (action === 'stats') return json_(stats_());
+    return json_({ error: 'unknown action' });
+  } catch (err) {
+    return json_({ error: String(err) });
+  }
+}
+
+function doPost(e) {
+  var req;
+  try { req = JSON.parse(e.postData.contents); }
+  catch (err) { return json_({ error: 'bad json' }); }
+  try {
+    switch (req.action) {
+      case 'submitEntry':    return json_(submitEntry_(req));
+      case 'spin':           return json_(spin_(req));
+      case 'submitDelivery': return json_(submitDelivery_(req));
+      case 'balance':        return json_({ ok: true, balance: balanceFor_(normPhone_(req.phone)) });
+      default:               return json_({ error: 'unknown action' });
+    }
+  } catch (err) {
+    return json_({ error: String(err) });
+  }
+}
+
+// ---------------------------------------------------------------- public reads
+
+function publicConfig_() {
+  var c = config_();
+  // Deliberately EXCLUDES milestones, weights, and the counter.
+  return {
+    ok: true,
+    campaign_start: c.campaign_start,
+    campaign_end: c.campaign_end,
+    outlets: c.outlets,
+    max_packs_per_entry: parseInt(c.max_packs_per_entry, 10) || 30,
+    max_spent_rm: parseInt(c.max_spent_rm, 10) || 2000,
+    gwp_threshold_rm: parseInt(c.gwp_threshold_rm, 10) || 50,
+    gold_spec: c.gold_spec,
+    test_mode: c.testMode
+  };
+}
+
+function stats_() {
+  var rows = sheet_('GoldWinners').getDataRange().getValues();
+  var winners = [];
+  for (var i = 1; i < rows.length; i++) {
+    var name = String(rows[i][5] || '');
+    var status = String(rows[i][12] || '');
+    winners.push({ n: i, name: status === 'PASS' && name ? maskName_(name) : null,
+                   verified: status === 'PASS' });
+  }
+  return { ok: true, gold_drawn: Math.max(0, rows.length - 1), gold_total: 4, winners: winners };
+}
+
+function maskName_(name) {
+  var parts = name.trim().split(/\s+/);
+  return parts.map(function (p, i) { return i === 0 ? p : p.charAt(0) + '.'; }).join(' ');
+}
+
+// ---------------------------------------------------------------- submitEntry
+
+function submitEntry_(req) {
+  var c = config_();
+
+  if (!c.testMode) {
+    var today = Utilities.formatDate(new Date(), 'Asia/Kuala_Lumpur', 'yyyy-MM-dd');
+    if (today < c.campaign_start || today > c.campaign_end) return { error: 'campaign_closed' };
+  }
+
+  if (!req.pdpa_consent) return { error: 'pdpa_required' };
+  var name = String(req.name || '').trim();
+  if (!name) return { error: 'name_required' };
+  var phone = normPhone_(req.phone);
+  if (!phone) return { error: 'phone_invalid' };
+  var email = String(req.email || '').trim();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return { error: 'email_invalid' };
+  if (c.outlets.indexOf(req.outlet) === -1) return { error: 'outlet_invalid' };
+  var origin = req.origin === 'work' ? 'work' : 'home';
+  if (BUYING_FOR.indexOf(req.buying_for) === -1) return { error: 'buying_for_invalid' };
+  var maxPacks = parseInt(c.max_packs_per_entry, 10) || 30;
+  var packs = parseInt(req.packs, 10);
+  if (!(packs >= 1 && packs <= maxPacks)) return { error: 'packs_invalid' };
+  var maxSpent = parseInt(c.max_spent_rm, 10) || 2000;
+  var spent = Math.round(parseFloat(req.total_spent_rm) * 100) / 100;
+  if (!(spent >= 0 && spent <= maxSpent)) return { error: 'spent_invalid' };
+  if (!req.receipt_b64) return { error: 'receipt_required' };
+
+  var glassCup = spent >= (parseInt(c.gwp_threshold_rm, 10) || 50);
+
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return { error: 'busy', retry: true };
+  try {
+    var entries = sheet_('Entries');
+    var data = entries.getDataRange().getValues();
+
+    // Idempotency: phone + receipt-prefix hash + 10-minute bucket
+    var bucket = Math.floor(Date.now() / 600000);
+    var idem = md5_(phone + '|' + String(req.receipt_b64).slice(0, 2000) + '|' + bucket);
+    for (var i = 1; i < data.length; i++) {
+      if (data[i][21] === idem) {
+        return { ok: true, duplicate: true, entry_id: data[i][0], tickets: data[i][7],
+                 glass_cup: data[i][8] === true, balance: balanceFor_(phone) };
+      }
+    }
+
+    // Rate limit
+    var maxPerDay = parseInt(c.max_entries_per_phone_per_day, 10) || 3;
+    var todayStr = Utilities.formatDate(new Date(), 'Asia/Kuala_Lumpur', 'yyyy-MM-dd');
+    var todayCount = 0;
+    for (var j = 1; j < data.length; j++) {
+      if (samePhone_(data[j][11], phone) && dayOf_(data[j][1]) === todayStr &&
+          data[j][17] !== 'VOID') todayCount++;
+    }
+    if (todayCount >= maxPerDay) return { error: 'daily_limit' };
+
+    var tickets = ticketsFor_(packs);
+    var entryId = 'SLA-' + pad_(data.length, 6);
+    var receiptUrl = saveReceipt_(req.receipt_b64, req.receipt_mime || 'image/jpeg', req.outlet, entryId);
+
+    entries.appendRow([
+      entryId, new Date().toISOString(), req.outlet, origin, req.buying_for, packs, spent,
+      tickets, glassCup, false, name, phone, email, receiptUrl, '', true,
+      !!req.marketing_optin, 'ACTIVE', '', '', '', idem
+    ]);
+    // Force phone cell to TEXT (Sheets coerces "+60…" appended strings to numbers).
+    var pcell = entries.getRange(entries.getLastRow(), 12);
+    pcell.setNumberFormat('@');
+    pcell.setValue(phone);
+
+    return { ok: true, entry_id: entryId, tickets: tickets, glass_cup: glassCup,
+             balance: balanceFor_(phone) };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function ticketsFor_(packs) {
+  return 5 * Math.floor(packs / 3) + (packs % 3);
+}
+
+function normPhone_(raw) {
+  var d = String(raw || '').replace(/\D/g, '');
+  if (d.indexOf('60') === 0) d = d.slice(2);
+  if (d.indexOf('0') === 0) d = d.slice(1);
+  if (!/^1\d{8,9}$/.test(d)) return null;
+  return '+60' + d;
+}
+
+function saveReceipt_(b64, mime, outlet, entryId) {
+  var root = DriveApp.getFolderById(PROPS.getProperty('RECEIPTS_FOLDER_ID'));
+  var it = root.getFoldersByName(outlet);
+  var folder = it.hasNext() ? it.next() : root.createFolder(outlet);
+  var ext = mime === 'image/png' ? '.png' : '.jpg';
+  var blob = Utilities.newBlob(Utilities.base64Decode(b64), mime, entryId + ext);
+  return folder.createFile(blob).getUrl();
+}
+
+// ---------------------------------------------------------------- spin
+
+function spin_(req) {
+  var phone = normPhone_(req.phone);
+  if (!phone) return { error: 'phone_invalid' };
+  var c = config_();
+  var reqId = String(req.request_id || '').trim();
+
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return { error: 'busy', retry: true };
+  try {
+    // Idempotent replay — same request_id never consumes a second ticket.
+    if (reqId) {
+      var prior = sheet_('SpinLog').getDataRange().getValues();
+      for (var p = 1; p < prior.length; p++) {
+        if (String(prior[p][7] || '') === reqId) {
+          return spinResponse_(c, prior[p][0], String(prior[p][5]), balanceFor_(phone), true);
+        }
+      }
+    }
+
+    var balance = balanceFor_(phone);
+    if (balance <= 0) return { error: 'no_tickets', balance: 0 };
+
+    var counters = sheet_('Counters');
+    var counter = parseInt(counters.getRange('B1').getValue(), 10) + 1;
+    counters.getRange('B1').setValue(counter);
+
+    var maxMilestone = Math.max.apply(null, c.milestones);
+    var isGold = c.milestones.indexOf(counter) !== -1 && counter <= maxMilestone;
+
+    var outcome;
+    if (isGold) {
+      outcome = 'GOLD';
+    } else {
+      // Weighted draw across STICKER / STRAP / RM5 voucher / RM10 voucher
+      var pool = [
+        ['STICKER', parseInt(c.weight_sticker, 10) || 30],
+        ['STRAP', parseInt(c.weight_strap, 10) || 20],
+        ['RM5', parseInt(c.weight_rm5, 10) || 35],
+        ['RM10', parseInt(c.weight_rm10, 10) || 15]
+      ];
+      var total = pool.reduce(function (s, x) { return s + x[1]; }, 0);
+      var roll = Math.random() * total;
+      for (var k = 0; k < pool.length; k++) {
+        roll -= pool[k][1];
+        if (roll < 0) { outcome = pool[k][0]; break; }
+      }
+      outcome = outcome || 'STICKER';
+    }
+    var voucherCode = outcome === 'RM5' ? c.voucher_code_rm5 :
+                      outcome === 'RM10' ? c.voucher_code_rm10 : '';
+
+    var spinId = 'SPN-' + Date.now().toString(36).toUpperCase() + '-' +
+                 Math.floor(Math.random() * 1679616).toString(36).toUpperCase();
+
+    var sl = sheet_('SpinLog');
+    sl.appendRow([spinId, counter, req.entry_id || '', phone, new Date().toISOString(),
+                  outcome, isGold, reqId, voucherCode]);
+    var slPhone = sl.getRange(sl.getLastRow(), 4);
+    slPhone.setNumberFormat('@');
+    slPhone.setValue(phone);
+
+    if (isGold) {
+      var gw = sheet_('GoldWinners');
+      gw.appendRow(['GW-' + pad_(gw.getLastRow(), 3), spinId, counter, phone,
+                    req.entry_id || '', '', '', '', '', '', '', '', 'PENDING',
+                    'NOT_STARTED', '', '', false]);
+      var gwPhone = gw.getRange(gw.getLastRow(), 4);
+      gwPhone.setNumberFormat('@');
+      gwPhone.setValue(phone);
+    }
+
+    return spinResponse_(c, spinId, outcome, balance - 1, false);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function spinResponse_(c, spinId, outcome, balance, replay) {
+  var code = outcome === 'RM5' ? c.voucher_code_rm5 :
+             outcome === 'RM10' ? c.voucher_code_rm10 : '';
+  return {
+    ok: true, spin_id: spinId, outcome: outcome, replay: replay || undefined,
+    voucher_code: code || undefined,
+    shopify_store_url: code ? c.shopify_store_url : undefined,
+    voucher_min_spend: code ? c.voucher_min_spend : undefined,
+    voucher_expiry: code ? c.voucher_expiry : undefined,
+    balance: balance
+  };
+}
+
+function balanceFor_(phone) {
+  var entries = sheet_('Entries').getDataRange().getValues();
+  var earned = 0;
+  for (var i = 1; i < entries.length; i++) {
+    if (samePhone_(entries[i][11], phone) && entries[i][17] !== 'VOID') {
+      earned += parseInt(entries[i][7], 10) || 0;
+    }
+  }
+  var spins = sheet_('SpinLog').getDataRange().getValues();
+  var spent = 0;
+  for (var j = 1; j < spins.length; j++) {
+    if (samePhone_(spins[j][3], phone)) spent++;
+  }
+  return earned - spent;
+}
+
+function samePhone_(cell, phone) {
+  var a = String(cell || '').replace(/\.0+$/, '').replace(/\D/g, '');
+  var b = String(phone || '').replace(/\D/g, '');
+  return a !== '' && a === b;
+}
+
+function dayOf_(v) {
+  if (v instanceof Date) return Utilities.formatDate(v, 'Asia/Kuala_Lumpur', 'yyyy-MM-dd');
+  return String(v).slice(0, 10);
+}
+
+// ---------------------------------------------------------------- submitDelivery
+
+function submitDelivery_(req) {
+  var spinId = String(req.spin_id || '').trim();
+  if (!spinId) return { error: 'spin_id_required' };
+
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return { error: 'busy', retry: true };
+  try {
+    var gw = sheet_('GoldWinners');
+    var data = gw.getDataRange().getValues();
+    for (var i = 1; i < data.length; i++) {
+      if (data[i][1] === spinId) {
+        gw.getRange(i + 1, 7).setNumberFormat('@');
+        gw.getRange(i + 1, 6, 1, 7).setValues([[
+          String(req.delivery_name || '').trim(),
+          String(normPhone_(req.delivery_phone) || req.delivery_phone || '').trim(),
+          String(req.addr1 || '').trim(), String(req.addr2 || '').trim(),
+          String(req.postcode || '').trim(), String(req.city || '').trim(),
+          String(req.state || '').trim()
+        ]]);
+        return { ok: true, winner_id: data[i][0], status: 'PENDING' };
+      }
+    }
+    return { error: 'spin_not_gold' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ---------------------------------------------------------------- utils
+
+function pad_(n, width) {
+  var s = String(n);
+  while (s.length < width) s = '0' + s;
+  return s;
+}
+
+function md5_(s) {
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, s)
+    .map(function (b) { return ((b & 0xff) + 0x100).toString(16).slice(1); }).join('');
+}
