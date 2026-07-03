@@ -143,17 +143,6 @@ function submitEntry_(req) {
   if (c.outlets.indexOf(req.outlet) === -1) return { error: 'outlet_invalid' };
   var origin = req.origin === 'work' ? 'work' : 'home';
   if (BUYING_FOR.indexOf(req.buying_for) === -1) return { error: 'buying_for_invalid' };
-  var maxPacks = parseInt(c.max_packs_per_entry, 10) || 30;
-  var items = req.items || {};
-  var itemQty = [], batik = 0, bunny = 0;
-  for (var si = 0; si < SKU_KEYS.length; si++) {
-    var q = parseInt(items[SKU_KEYS[si]], 10) || 0;
-    if (q < 0 || q > maxPacks) return { error: 'packs_invalid' };
-    itemQty.push(q);
-    if (SKU_KEYS[si].indexOf('bb_') === 0) bunny += q; else batik += q;
-  }
-  var packs = batik + bunny;
-  if (!(packs >= 1 && packs <= maxPacks)) return { error: 'packs_invalid' };
   var maxSpent = parseInt(c.max_spent_rm, 10) || 2000;
   var spent = Math.round(parseFloat(req.total_spent_rm) * 100) / 100;
   if (!(spent >= 0 && spent <= maxSpent)) return { error: 'spent_invalid' };
@@ -192,10 +181,10 @@ function submitEntry_(req) {
     var receiptUrl = saveReceipt_(req.receipt_b64, req.receipt_mime || 'image/jpeg', req.outlet, entryId);
 
     entries.appendRow([
-      entryId, new Date().toISOString(), req.outlet, origin, req.buying_for, packs, spent,
+      entryId, new Date().toISOString(), req.outlet, origin, req.buying_for, '', spent,
       tickets, glassCup, false, name, phone, email, receiptUrl, '', true,
-      !!req.marketing_optin, 'ACTIVE', '', '', '', idem, batik, bunny
-    ].concat(itemQty));
+      !!req.marketing_optin, 'ACTIVE', '', '', '', idem
+    ]); // packs + per-item cols left blank — staff record item sales in Telegram group
     // Force phone cell to TEXT (Sheets coerces "+60…" appended strings to numbers).
     var pcell = entries.getRange(entries.getLastRow(), 12);
     pcell.setNumberFormat('@');
@@ -208,14 +197,16 @@ function submitEntry_(req) {
   }
 }
 
-// Draws come from SPEND TIERS (Marcus 2026-07-03): RM25+ = 1 draw, RM50+ = 3 draws
-// (values config-driven). Packs are recorded per series for data, not for tickets.
+// Draws from SPEND TIERS (Marcus final 2026-07-03): ANY purchase = 1 draw,
+// RM25+ = 2 draws, RM50+ = 3 draws (config-driven). Item quantities are NOT captured
+// in-game — staff record item sales in their Telegram group.
 function ticketsFor_(c, spent) {
   var t2rm = parseFloat(c.draw_tier2_rm) || 50, t2d = parseInt(c.draw_tier2_draws, 10) || 3;
-  var t1rm = parseFloat(c.draw_tier1_rm) || 25, t1d = parseInt(c.draw_tier1_draws, 10) || 1;
+  var t1rm = parseFloat(c.draw_tier1_rm) || 25, t1d = parseInt(c.draw_tier1_draws, 10) || 2;
+  var base = parseInt(c.draw_base, 10) || 1;
   if (spent >= t2rm) return t2d;
   if (spent >= t1rm) return t1d;
-  return 0;
+  return base;
 }
 
 function normPhone_(raw) {
