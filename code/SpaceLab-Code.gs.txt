@@ -87,6 +87,10 @@ function publicConfig_() {
     max_packs_per_entry: parseInt(c.max_packs_per_entry, 10) || 30,
     max_spent_rm: parseInt(c.max_spent_rm, 10) || 2000,
     gwp_threshold_rm: parseInt(c.gwp_threshold_rm, 10) || 50,
+    draw_tier1_rm: parseFloat(c.draw_tier1_rm) || 25,
+    draw_tier1_draws: parseInt(c.draw_tier1_draws, 10) || 1,
+    draw_tier2_rm: parseFloat(c.draw_tier2_rm) || 50,
+    draw_tier2_draws: parseInt(c.draw_tier2_draws, 10) || 3,
     gold_spec: c.gold_spec,
     test_mode: c.testMode
   };
@@ -130,8 +134,10 @@ function submitEntry_(req) {
   var origin = req.origin === 'work' ? 'work' : 'home';
   if (BUYING_FOR.indexOf(req.buying_for) === -1) return { error: 'buying_for_invalid' };
   var maxPacks = parseInt(c.max_packs_per_entry, 10) || 30;
-  var packs = parseInt(req.packs, 10);
-  if (!(packs >= 1 && packs <= maxPacks)) return { error: 'packs_invalid' };
+  var batik = parseInt(req.batik_packs, 10) || 0;
+  var bunny = parseInt(req.bunny_packs, 10) || 0;
+  var packs = batik + bunny;
+  if (batik < 0 || bunny < 0 || !(packs >= 1 && packs <= maxPacks)) return { error: 'packs_invalid' };
   var maxSpent = parseInt(c.max_spent_rm, 10) || 2000;
   var spent = Math.round(parseFloat(req.total_spent_rm) * 100) / 100;
   if (!(spent >= 0 && spent <= maxSpent)) return { error: 'spent_invalid' };
@@ -165,14 +171,14 @@ function submitEntry_(req) {
     }
     if (todayCount >= maxPerDay) return { error: 'daily_limit' };
 
-    var tickets = ticketsFor_(packs);
+    var tickets = ticketsFor_(c, spent);
     var entryId = 'SLA-' + pad_(data.length, 6);
     var receiptUrl = saveReceipt_(req.receipt_b64, req.receipt_mime || 'image/jpeg', req.outlet, entryId);
 
     entries.appendRow([
       entryId, new Date().toISOString(), req.outlet, origin, req.buying_for, packs, spent,
       tickets, glassCup, false, name, phone, email, receiptUrl, '', true,
-      !!req.marketing_optin, 'ACTIVE', '', '', '', idem
+      !!req.marketing_optin, 'ACTIVE', '', '', '', idem, batik, bunny
     ]);
     // Force phone cell to TEXT (Sheets coerces "+60…" appended strings to numbers).
     var pcell = entries.getRange(entries.getLastRow(), 12);
@@ -186,8 +192,14 @@ function submitEntry_(req) {
   }
 }
 
-function ticketsFor_(packs) {
-  return 5 * Math.floor(packs / 3) + (packs % 3);
+// Draws come from SPEND TIERS (Marcus 2026-07-03): RM25+ = 1 draw, RM50+ = 3 draws
+// (values config-driven). Packs are recorded per series for data, not for tickets.
+function ticketsFor_(c, spent) {
+  var t2rm = parseFloat(c.draw_tier2_rm) || 50, t2d = parseInt(c.draw_tier2_draws, 10) || 3;
+  var t1rm = parseFloat(c.draw_tier1_rm) || 25, t1d = parseInt(c.draw_tier1_draws, 10) || 1;
+  if (spent >= t2rm) return t2d;
+  if (spent >= t1rm) return t1d;
+  return 0;
 }
 
 function normPhone_(raw) {
