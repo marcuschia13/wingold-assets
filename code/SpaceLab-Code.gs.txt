@@ -64,6 +64,7 @@ function doPost(e) {
     switch (req.action) {
       case 'submitEntry':    return json_(submitEntry_(req));
       case 'spin':           return json_(spin_(req));
+      case 'spinAll':        return json_(spinAll_(req));
       case 'submitDelivery': return json_(submitDelivery_(req));
       case 'balance':        return json_({ ok: true, balance: balanceFor_(normPhone_(req.phone)) });
       default:               return json_({ error: 'unknown action' });
@@ -234,30 +235,9 @@ function spin_(req) {
     var counter = parseInt(counters.getRange('B1').getValue(), 10) + 1;
     counters.getRange('B1').setValue(counter);
 
-    var maxMilestone = Math.max.apply(null, c.milestones);
-    var isGold = c.milestones.indexOf(counter) !== -1 && counter <= maxMilestone;
-
-    var outcome;
-    if (isGold) {
-      outcome = 'GOLD';
-    } else {
-      // Weighted draw across STICKER / STRAP / RM5 voucher / RM10 voucher
-      var pool = [
-        ['STICKER', parseInt(c.weight_sticker, 10) || 30],
-        ['STRAP', parseInt(c.weight_strap, 10) || 20],
-        ['RM5', parseInt(c.weight_rm5, 10) || 35],
-        ['RM10', parseInt(c.weight_rm10, 10) || 15]
-      ];
-      var total = pool.reduce(function (s, x) { return s + x[1]; }, 0);
-      var roll = Math.random() * total;
-      for (var k = 0; k < pool.length; k++) {
-        roll -= pool[k][1];
-        if (roll < 0) { outcome = pool[k][0]; break; }
-      }
-      outcome = outcome || 'STICKER';
-    }
-    var voucherCode = outcome === 'RM5' ? c.voucher_code_rm5 :
-                      outcome === 'RM10' ? c.voucher_code_rm10 : '';
+    var outcome = resolveOutcome_(c, counter);
+    var isGold = outcome === 'GOLD';
+    var voucherCode = voucherFor_(c, outcome);
 
     var spinId = 'SPN-' + Date.now().toString(36).toUpperCase() + '-' +
                  Math.floor(Math.random() * 1679616).toString(36).toUpperCase();
@@ -283,6 +263,116 @@ function spin_(req) {
   } finally {
     lock.releaseLock();
   }
+}
+
+// Resolve one spin outcome for a given post-increment counter value.
+function resolveOutcome_(c, counterValue) {
+  var maxMilestone = Math.max.apply(null, c.milestones);
+  if (c.milestones.indexOf(counterValue) !== -1 && counterValue <= maxMilestone) {
+    return 'GOLD';
+  }
+  var pool = [
+    ['STICKER', parseInt(c.weight_sticker, 10) || 30],
+    ['STRAP', parseInt(c.weight_strap, 10) || 20],
+    ['RM5', parseInt(c.weight_rm5, 10) || 35],
+    ['RM10', parseInt(c.weight_rm10, 10) || 15]
+  ];
+  var total = pool.reduce(function (s, x) { return s + x[1]; }, 0);
+  var roll = Math.random() * total;
+  for (var k = 0; k < pool.length; k++) {
+    roll -= pool[k][1];
+    if (roll < 0) return pool[k][0];
+  }
+  return 'STICKER';
+}
+
+function voucherFor_(c, outcome) {
+  return outcome === 'RM5' ? c.voucher_code_rm5 :
+         outcome === 'RM10' ? c.voucher_code_rm10 : '';
+}
+
+// Draw ALL remaining tickets in one atomic batch. Each intermediate counter value
+// is milestone-checked exactly like a single spin, so gold can land mid-batch and
+// the SpinLog stays strictly sequential. Idempotent via request_id (whole batch).
+function spinAll_(req) {
+  var phone = normPhone_(req.phone);
+  if (!phone) return { error: 'phone_invalid' };
+  var c = config_();
+  var reqId = String(req.request_id || '').trim();
+
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return { error: 'busy', retry: true };
+  try {
+    var sl = sheet_('SpinLog');
+    if (reqId) {
+      var prior = sl.getDataRange().getValues();
+      var replayed = [];
+      for (var p = 1; p < prior.length; p++) {
+        if (String(prior[p][7] || '') === reqId) {
+          replayed.push({ spin_id: prior[p][0], outcome: String(prior[p][5]),
+                          voucher_code: String(prior[p][8] || '') || undefined });
+        }
+      }
+      if (replayed.length) return batchResponse_(c, replayed, balanceFor_(phone), true);
+    }
+
+    var balance = balanceFor_(phone);
+    if (balance <= 0) return { error: 'no_tickets', balance: 0 };
+    var n = Math.min(balance, 60); // safety cap well above the 50-ticket max entry
+
+    var counters = sheet_('Counters');
+    var start = parseInt(counters.getRange('B1').getValue(), 10);
+    counters.getRange('B1').setValue(start + n);
+
+    var nowIso = new Date().toISOString();
+    var rows = [], results = [], goldSpins = [];
+    for (var i = 1; i <= n; i++) {
+      var cv = start + i;
+      var outcome = resolveOutcome_(c, cv);
+      var code = voucherFor_(c, outcome);
+      var spinId = 'SPN-' + Date.now().toString(36).toUpperCase() + '-' + i + '-' +
+                   Math.floor(Math.random() * 1679616).toString(36).toUpperCase();
+      rows.push([spinId, cv, req.entry_id || '', phone, nowIso,
+                 outcome, outcome === 'GOLD', reqId, code]);
+      results.push({ spin_id: spinId, outcome: outcome, voucher_code: code || undefined });
+      if (outcome === 'GOLD') goldSpins.push({ spinId: spinId, cv: cv });
+    }
+
+    var startRow = sl.getLastRow() + 1;
+    sl.getRange(startRow, 4, n, 1).setNumberFormat('@'); // phone col text BEFORE write
+    sl.getRange(startRow, 1, n, rows[0].length).setValues(rows);
+
+    // Abandon-safe gold rows for every gold in the batch
+    var gw = sheet_('GoldWinners');
+    goldSpins.forEach(function (g) {
+      gw.appendRow(['GW-' + pad_(gw.getLastRow(), 3), g.spinId, g.cv, phone,
+                    req.entry_id || '', '', '', '', '', '', '', '', 'PENDING',
+                    'NOT_STARTED', '', '', false]);
+      var gp = gw.getRange(gw.getLastRow(), 4);
+      gp.setNumberFormat('@');
+      gp.setValue(phone);
+    });
+
+    return batchResponse_(c, results, balance - n, false);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function batchResponse_(c, results, balance, replay) {
+  var tally = {};
+  results.forEach(function (r) { tally[r.outcome] = (tally[r.outcome] || 0) + 1; });
+  var hasVoucher = results.some(function (r) { return r.voucher_code; });
+  return {
+    ok: true, mode: 'all', replay: replay || undefined,
+    results: results, tally: tally,
+    gold_spin_ids: results.filter(function (r) { return r.outcome === 'GOLD'; })
+      .map(function (r) { return r.spin_id; }),
+    voucher_min_spend: hasVoucher ? c.voucher_min_spend : undefined,
+    voucher_expiry: hasVoucher ? c.voucher_expiry : undefined,
+    shopify_store_url: hasVoucher ? c.shopify_store_url : undefined,
+    balance: balance
+  };
 }
 
 function spinResponse_(c, spinId, outcome, balance, replay) {
