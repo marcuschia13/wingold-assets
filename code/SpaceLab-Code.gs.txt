@@ -16,6 +16,11 @@
 
 var PROPS = PropertiesService.getScriptProperties();
 var BUYING_FOR = ['self', 'kids', 'family', 'friend'];
+// Per-item capture: order matches Entries!Y:AJ columns. bb_* = Berry Bunny (Harriston choco),
+// fd_* = Batik Freeze Dried.
+var SKU_KEYS = ['bb_dark','bb_white','bb_matcha','bb_strawberry','fd_strawberry',
+  'fd_strawberry_yogurt','fd_blueberry_yogurt','fd_mango_yogurt','fd_jackfruit',
+  'fd_dragonfruit','fd_durian','fd_mango'];
 
 function ss_() { return SpreadsheetApp.openById(PROPS.getProperty('SPREADSHEET_ID')); }
 
@@ -33,6 +38,10 @@ function config_() {
   }
   cfg.milestones = (cfg.milestones || '').split(',').map(function (x) { return parseInt(x, 10); }).filter(Boolean);
   cfg.outlets = (cfg.outlet_list || '').split('|').map(function (s) { return s.trim(); }).filter(Boolean);
+  cfg.skus = (cfg.sku_list || '').split('|').map(function (x) {
+    var i = x.indexOf(':');
+    return { key: x.slice(0, i).trim(), name: x.slice(i + 1).trim() };
+  }).filter(function (x) { return x.key; });
   cfg.testMode = String(cfg.test_mode).toUpperCase() === 'TRUE';
   return cfg;
 }
@@ -91,6 +100,7 @@ function publicConfig_() {
     draw_tier1_draws: parseInt(c.draw_tier1_draws, 10) || 1,
     draw_tier2_rm: parseFloat(c.draw_tier2_rm) || 50,
     draw_tier2_draws: parseInt(c.draw_tier2_draws, 10) || 3,
+    skus: c.skus,
     gold_spec: c.gold_spec,
     test_mode: c.testMode
   };
@@ -134,10 +144,16 @@ function submitEntry_(req) {
   var origin = req.origin === 'work' ? 'work' : 'home';
   if (BUYING_FOR.indexOf(req.buying_for) === -1) return { error: 'buying_for_invalid' };
   var maxPacks = parseInt(c.max_packs_per_entry, 10) || 30;
-  var batik = parseInt(req.batik_packs, 10) || 0;
-  var bunny = parseInt(req.bunny_packs, 10) || 0;
+  var items = req.items || {};
+  var itemQty = [], batik = 0, bunny = 0;
+  for (var si = 0; si < SKU_KEYS.length; si++) {
+    var q = parseInt(items[SKU_KEYS[si]], 10) || 0;
+    if (q < 0 || q > maxPacks) return { error: 'packs_invalid' };
+    itemQty.push(q);
+    if (SKU_KEYS[si].indexOf('bb_') === 0) bunny += q; else batik += q;
+  }
   var packs = batik + bunny;
-  if (batik < 0 || bunny < 0 || !(packs >= 1 && packs <= maxPacks)) return { error: 'packs_invalid' };
+  if (!(packs >= 1 && packs <= maxPacks)) return { error: 'packs_invalid' };
   var maxSpent = parseInt(c.max_spent_rm, 10) || 2000;
   var spent = Math.round(parseFloat(req.total_spent_rm) * 100) / 100;
   if (!(spent >= 0 && spent <= maxSpent)) return { error: 'spent_invalid' };
@@ -179,7 +195,7 @@ function submitEntry_(req) {
       entryId, new Date().toISOString(), req.outlet, origin, req.buying_for, packs, spent,
       tickets, glassCup, false, name, phone, email, receiptUrl, '', true,
       !!req.marketing_optin, 'ACTIVE', '', '', '', idem, batik, bunny
-    ]);
+    ].concat(itemQty));
     // Force phone cell to TEXT (Sheets coerces "+60…" appended strings to numbers).
     var pcell = entries.getRange(entries.getLastRow(), 12);
     pcell.setNumberFormat('@');
