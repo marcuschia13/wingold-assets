@@ -1,0 +1,329 @@
+/**
+ * Promoter Hub — Apps Script backend
+ * Game-styled sampling app for promoters: login → outlet → brand → shift → check in →
+ * tap-to-log sales/samples → breaks → undo → check out.
+ *
+ * Writes EVENT ROWS IDENTICAL to SpaceLabBot/samplingsheet.py into the SAME sampling
+ * spreadsheet, per-outlet monthly tabs "MM/YY {OUTLET} — Activity":
+ *   [Timestamp, Date, Time, Promoter, Action, Code, Item, Qty, Unit RM, Sales RM]
+ * Actions: CHECK IN / CHECK OUT / SALE / SAMPLE / VOID (undo, negative qty) /
+ *          BREAK|TOILET|SURAU — OUT/BACK labels (see STATUS_LABELS).
+ *
+ * Config/roster tabs: "App Config" (outlets_json / brands_json / shifts_json) +
+ * "App Roster" (Name, Phone, Active). Blank roster phone = first login claims it.
+ *
+ * Deploy as Web App, execute as lotspace.my@gmail.com, access Anyone.
+ * Script Properties: SHEET_ID (the sampling spreadsheet).
+ * Invariants: append-only (undo = VOID row), LockService on writes, request_id
+ * idempotency via "App Requests" tab, phone cells forced to TEXT in code.
+ */
+
+var PROPS = PropertiesService.getScriptProperties();
+var TZ = 'Asia/Kuala_Lumpur';
+var HEADERS = ['Timestamp', 'Date', 'Time', 'Promoter', 'Action',
+               'Code', 'Item', 'Qty', 'Unit RM', 'Sales RM'];
+var STATUS_LABELS = {
+  'break_out': 'BREAK — OUT (resting)', 'break_in': 'BREAK — BACK',
+  'toilet_out': 'TOILET — OUT', 'toilet_in': 'TOILET — BACK',
+  'surau_out': 'SURAU — OUT (prayer)', 'surau_in': 'SURAU — BACK'
+};
+
+function ss_() { return SpreadsheetApp.openById(PROPS.getProperty('SHEET_ID')); }
+
+function json_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function now_() { return new Date(); }
+function fmt_(d, p) { return Utilities.formatDate(d, TZ, p); }
+function tabName_(outlet, d) { return fmt_(d, 'MM/yy') + ' ' + outlet + ' — Activity'; }
+
+function tab_(outlet, d) {
+  var ss = ss_();
+  var name = tabName_(outlet, d);
+  var sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    sh.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
+  }
+  return sh;
+}
+
+function config_() {
+  var rows = ss_().getSheetByName('App Config').getDataRange().getValues();
+  var cfg = {};
+  for (var i = 1; i < rows.length; i++) {
+    if (rows[i][0]) cfg[String(rows[i][0]).trim()] = String(rows[i][1]);
+  }
+  return {
+    outlets: JSON.parse(cfg.outlets_json || '[]'),
+    brands: JSON.parse(cfg.brands_json || '{}'),
+    shifts: JSON.parse(cfg.shifts_json || '[]')
+  };
+}
+
+// ---------------------------------------------------------------- routing
+
+function doGet(e) {
+  var action = (e && e.parameter && e.parameter.action) || 'health';
+  try {
+    if (action === 'health') return json_({ ok: true, ts: new Date().toISOString() });
+    if (action === 'getSetup') {
+      var c = config_();
+      return json_({ ok: true, outlets: c.outlets, brands: c.brands, shifts: c.shifts,
+                     roster: rosterNames_() });
+    }
+    return json_({ error: 'unknown action' });
+  } catch (err) {
+    return json_({ error: String(err) });
+  }
+}
+
+function doPost(e) {
+  var req;
+  try { req = JSON.parse(e.postData.contents); }
+  catch (err) { return json_({ error: 'bad json' }); }
+  try {
+    switch (req.action) {
+      case 'login':    return json_(login_(req));
+      case 'checkin':  return json_(clock_(req, 'CHECK IN'));
+      case 'checkout': return json_(clock_(req, 'CHECK OUT'));
+      case 'sale':     return json_(sale_(req));
+      case 'undo':     return json_(undo_(req));
+      case 'status':   return json_(status_(req));
+      case 'standing': return json_(standing_(req.name, req.outlet, req.target));
+      default:         return json_({ error: 'unknown action' });
+    }
+  } catch (err) {
+    return json_({ error: String(err) });
+  }
+}
+
+// ---------------------------------------------------------------- roster / login
+
+function rosterNames_() {
+  var rows = ss_().getSheetByName('App Roster').getDataRange().getValues();
+  var names = [];
+  for (var i = 1; i < rows.length; i++) {
+    if (rows[i][0] && String(rows[i][2]).toUpperCase() !== 'FALSE') names.push(String(rows[i][0]));
+  }
+  return names;
+}
+
+function normPhone_(raw) {
+  var d = String(raw || '').replace(/\D/g, '');
+  if (d.indexOf('60') === 0) d = d.slice(2);
+  if (d.indexOf('0') === 0) d = d.slice(1);
+  if (!/^1\d{8,9}$/.test(d)) return null;
+  return '+60' + d;
+}
+
+function samePhone_(cell, phone) {
+  var a = String(cell || '').replace(/\.0+$/, '').replace(/\D/g, '');
+  var b = String(phone || '').replace(/\D/g, '');
+  return a !== '' && a === b;
+}
+
+// Login: roster name + phone. Blank roster phone = first login claims it (stored as
+// TEXT). Wrong phone after that = rejected — bonus payouts ride on this identity.
+function login_(req) {
+  var name = String(req.name || '').trim();
+  var phone = normPhone_(req.phone);
+  if (!name) return { error: 'name_required' };
+  if (!phone) return { error: 'phone_invalid' };
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return { error: 'busy', retry: true };
+  try {
+    var sh = ss_().getSheetByName('App Roster');
+    var rows = sh.getDataRange().getValues();
+    for (var i = 1; i < rows.length; i++) {
+      if (String(rows[i][0]).trim().toLowerCase() === name.toLowerCase()) {
+        if (String(rows[i][2]).toUpperCase() === 'FALSE') return { error: 'inactive' };
+        var stored = String(rows[i][1] || '').trim();
+        if (!stored) {
+          var cell = sh.getRange(i + 1, 2);
+          cell.setNumberFormat('@');
+          cell.setValue(phone);
+          return { ok: true, name: rows[i][0], claimed: true };
+        }
+        if (samePhone_(stored, phone)) return { ok: true, name: rows[i][0] };
+        return { error: 'phone_mismatch' };
+      }
+    }
+    return { error: 'name_not_found' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ---------------------------------------------------------------- idempotency
+
+function seenRequest_(reqId) {
+  if (!reqId) return false;
+  var ss = ss_();
+  var sh = ss.getSheetByName('App Requests');
+  if (!sh) {
+    sh = ss.insertSheet('App Requests');
+    sh.getRange(1, 1).setValue('request_id');
+  }
+  var last = sh.getLastRow();
+  var start = Math.max(2, last - 500);          // scan recent window only
+  if (last >= 2) {
+    var vals = sh.getRange(start, 1, last - start + 1, 1).getValues();
+    for (var i = 0; i < vals.length; i++) {
+      if (String(vals[i][0]) === reqId) return true;
+    }
+  }
+  sh.appendRow([reqId]);
+  return false;
+}
+
+// ---------------------------------------------------------------- event writes
+
+function row_(d, name, action, code, item, qty, price, rm) {
+  return [fmt_(d, 'yyyy-MM-dd HH:mm:ss'), fmt_(d, 'yyyy-MM-dd'), fmt_(d, 'HH:mm'),
+          name, action, code || '', item || '', qty === undefined ? '' : qty,
+          price === undefined || price === null ? '' : price,
+          rm === undefined || rm === null ? '' : rm];
+}
+
+function clock_(req, label) {
+  var name = String(req.name || '').trim();
+  var outlet = String(req.outlet || '').trim();
+  if (!name || !outlet) return { error: 'missing_fields' };
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return { error: 'busy', retry: true };
+  try {
+    if (seenRequest_(String(req.request_id || ''))) return { ok: true, replay: true };
+    var d = now_();
+    tab_(outlet, d).appendRow(row_(d, name, label));
+    var out = { ok: true, time: fmt_(d, 'HH:mm') };
+    if (label === 'CHECK OUT') out.standing = standing_(name, outlet, req.target);
+    return out;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function sale_(req) {
+  var name = String(req.name || '').trim();
+  var outlet = String(req.outlet || '').trim();
+  var brand = String(req.brand || '').trim();
+  var items = req.items || {};
+  if (!name || !outlet || !brand) return { error: 'missing_fields' };
+  var cfg = config_();
+  var brandCfg = cfg.brands[brand];
+  if (!brandCfg) return { error: 'brand_invalid' };
+  var isSample = req.sample === true;
+
+  var lines = [];
+  for (var code in items) {
+    var qty = parseInt(items[code], 10) || 0;
+    if (qty <= 0) continue;
+    if (qty > 200) return { error: 'qty_invalid' };
+    var it = brandCfg.items[code];
+    if (!it) return { error: 'code_invalid: ' + code };
+    lines.push({ code: code, item: it.name, qty: qty, price: it.price });
+  }
+  if (!lines.length) return { error: 'no_items' };
+
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return { error: 'busy', retry: true };
+  try {
+    if (seenRequest_(String(req.request_id || ''))) {
+      return { ok: true, replay: true, standing: standing_(name, outlet, req.target) };
+    }
+    var d = now_();
+    var sh = tab_(outlet, d);
+    lines.forEach(function (l) {
+      if (isSample) {
+        sh.appendRow(row_(d, name, 'SAMPLE', l.code, l.item, l.qty));
+      } else {
+        var rm = l.price ? Math.round(l.price * l.qty * 100) / 100 : null;
+        sh.appendRow(row_(d, name, 'SALE', l.code, l.item, l.qty, l.price, rm));
+      }
+    });
+    return { ok: true, standing: standing_(name, outlet, req.target) };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// Undo = VOID row with negative qty/RM (append-only; column sums stay correct).
+// Voids the CALLER'S most recent un-voided SALE or SAMPLE line today.
+function undo_(req) {
+  var name = String(req.name || '').trim();
+  var outlet = String(req.outlet || '').trim();
+  if (!name || !outlet) return { error: 'missing_fields' };
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return { error: 'busy', retry: true };
+  try {
+    var d = now_();
+    var sh = tab_(outlet, d);
+    var rows = sh.getDataRange().getValues();
+    var today = fmt_(d, 'yyyy-MM-dd');
+    var voided = {};
+    for (var i = rows.length - 1; i >= 1; i--) {
+      var r = rows[i];
+      if (String(r[1]) !== today || String(r[3]) !== name) continue;
+      var action = String(r[4]);
+      var key = r[5] + '|' + Math.abs(parseFloat(r[7]) || 0);
+      if (action.indexOf('VOID') === 0) { voided[key] = (voided[key] || 0) + 1; continue; }
+      if (action === 'SALE' || action === 'SAMPLE') {
+        if (voided[key] > 0) { voided[key]--; continue; }
+        var qty = -(parseFloat(r[7]) || 0);
+        var rm = r[9] === '' || r[9] === null ? null : -(parseFloat(r[9]) || 0);
+        sh.appendRow(row_(d, name, 'VOID (undo)', r[5], r[6], qty, null, rm));
+        return { ok: true, undone: { code: r[5], item: r[6], qty: Math.abs(qty) },
+                 standing: standing_(name, outlet, req.target) };
+      }
+    }
+    return { error: 'nothing_to_undo' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function status_(req) {
+  var name = String(req.name || '').trim();
+  var outlet = String(req.outlet || '').trim();
+  var key = String(req.activity || '') + '_' + String(req.direction || '');
+  var label = STATUS_LABELS[key];
+  if (!name || !outlet || !label) return { error: 'missing_fields' };
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return { error: 'busy', retry: true };
+  try {
+    var d = now_();
+    tab_(outlet, d).appendRow(row_(d, name, label));
+    return { ok: true, time: fmt_(d, 'HH:mm') };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// Today's tallies for the bonus bar: my packs / outlet packs / my RM / samples.
+function standing_(name, outlet, target) {
+  var d = now_();
+  var sh = ss_().getSheetByName(tabName_(outlet, d));
+  var me = 0, out = 0, meRm = 0, samples = 0;
+  if (sh) {
+    var rows = sh.getDataRange().getValues();
+    var today = fmt_(d, 'yyyy-MM-dd');
+    for (var i = 1; i < rows.length; i++) {
+      var r = rows[i];
+      if (String(r[1]) !== today) continue;
+      var action = String(r[4]);
+      var qty = parseFloat(r[7]) || 0;
+      var rm = parseFloat(r[9]) || 0;
+      if (action === 'SALE' || action.indexOf('VOID') === 0) {
+        out += qty;
+        if (String(r[3]) === name) { me += qty; meRm += rm; }
+      } else if (action === 'SAMPLE' && String(r[3]) === name) {
+        samples += qty;
+      }
+    }
+  }
+  return { ok: true, me_packs: me, outlet_packs: out, me_rm: Math.round(meRm * 100) / 100,
+           me_samples: samples, target: parseInt(target, 10) || 50 };
+}
