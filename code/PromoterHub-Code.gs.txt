@@ -125,6 +125,12 @@ function rosterNames_() {
   return names;
 }
 
+function genPassword_() {
+  var pw = '';
+  for (var i = 0; i < 6; i++) pw += Math.floor(Math.random() * 10);
+  return pw;
+}
+
 function normPhone_(raw) {
   var d = String(raw || '').replace(/\D/g, '');
   if (d.indexOf('60') === 0) d = d.slice(2);
@@ -139,41 +145,29 @@ function samePhone_(cell, phone) {
   return a !== '' && a === b;
 }
 
-// Login: roster name + phone. Blank roster phone = first login claims it (stored as
-// TEXT). Wrong phone after that = rejected — bonus payouts ride on this identity.
+// Login: roster name + auto-generated 6-digit password (Marcus 2026-07-05; replaces
+// the phone-claim model). Passwords live in Roster col B as TEXT; leaders see and
+// regenerate them in the dashboard.
 function login_(req) {
   var name = String(req.name || '').trim();
-  var phone = normPhone_(req.phone);
+  var pw = String(req.password || '').trim();
   if (!name) return { error: 'name_required' };
-  if (!phone) return { error: 'phone_invalid' };
-  var lock = LockService.getScriptLock();
-  if (!lock.tryLock(10000)) return { error: 'busy', retry: true };
-  try {
-    var sh = ss_().getSheetByName('App Roster');
-    var rows = sh.getDataRange().getValues();
-    for (var i = 1; i < rows.length; i++) {
-      if (String(rows[i][0]).trim().toLowerCase() === name.toLowerCase()) {
-        if (String(rows[i][2]).toUpperCase() === 'FALSE') return { error: 'inactive' };
-        var today = fmt_(now_(), 'yyyy-MM-dd');
-        var from = rows[i][3] ? dayOf_(rows[i][3]) : '';
-        var to = rows[i][4] ? dayOf_(rows[i][4]) : '';
-        if (from && today < from) return { error: 'not_started' };
-        if (to && today > to) return { error: 'period_ended' };
-        var stored = String(rows[i][1] || '').trim();
-        if (!stored) {
-          var cell = sh.getRange(i + 1, 2);
-          cell.setNumberFormat('@');
-          cell.setValue(phone);
-          return { ok: true, name: rows[i][0], claimed: true };
-        }
-        if (samePhone_(stored, phone)) return { ok: true, name: rows[i][0] };
-        return { error: 'phone_mismatch' };
-      }
+  if (!/^\d{6}$/.test(pw)) return { error: 'password_invalid' };
+  var rows = ss_().getSheetByName('App Roster').getDataRange().getValues();
+  for (var i = 1; i < rows.length; i++) {
+    if (String(rows[i][0]).trim().toLowerCase() === name.toLowerCase()) {
+      if (String(rows[i][2]).toUpperCase() === 'FALSE') return { error: 'inactive' };
+      var today = fmt_(now_(), 'yyyy-MM-dd');
+      var from = rows[i][3] ? dayOf_(rows[i][3]) : '';
+      var to = rows[i][4] ? dayOf_(rows[i][4]) : '';
+      if (from && today < from) return { error: 'not_started' };
+      if (to && today > to) return { error: 'period_ended' };
+      var stored = String(rows[i][1] || '').trim().replace(/\.0+$/, '');
+      if (stored === pw) return { ok: true, name: rows[i][0] };
+      return { error: 'wrong_password' };
     }
-    return { error: 'name_not_found' };
-  } finally {
-    lock.releaseLock();
   }
+  return { error: 'name_not_found' };
 }
 
 // ---------------------------------------------------------------- idempotency
@@ -408,7 +402,8 @@ function getAdmin_(req) {
   var roster = [];
   for (var i = 1; i < rows.length; i++) {
     if (!rows[i][0]) continue;
-    roster.push({ name: String(rows[i][0]), has_phone: !!String(rows[i][1] || '').trim(),
+    roster.push({ name: String(rows[i][0]),
+                  password: String(rows[i][1] || '').trim().replace(/\.0+$/, ''),
                   active: String(rows[i][2]).toUpperCase() !== 'FALSE',
                   from: rows[i][3] ? dayOf_(rows[i][3]) : '',
                   to: rows[i][4] ? dayOf_(rows[i][4]) : '' });
@@ -437,8 +432,12 @@ function addUser_(req) {
         return { error: 'name_exists' };
       }
     }
-    sh.appendRow([name, '', 'TRUE', String(req.from || ''), String(req.to || '')]);
-    return { ok: true, name: name };
+    var pw = genPassword_();
+    sh.appendRow([name, pw, 'TRUE', String(req.from || ''), String(req.to || '')]);
+    var pcell = sh.getRange(sh.getLastRow(), 2);
+    pcell.setNumberFormat('@');
+    pcell.setValue(pw);
+    return { ok: true, name: name, password: pw };
   } finally {
     lock.releaseLock();
   }
@@ -458,8 +457,15 @@ function setUser_(req) {
         if (req.active !== undefined) sh.getRange(i + 1, 3).setValue(req.active ? 'TRUE' : 'FALSE');
         if (req.from !== undefined) sh.getRange(i + 1, 4).setValue(String(req.from || ''));
         if (req.to !== undefined) sh.getRange(i + 1, 5).setValue(String(req.to || ''));
-        if (req.reset_phone === true) sh.getRange(i + 1, 2).setValue('');
-        return { ok: true, name: rows[i][0] };
+        var out = { ok: true, name: rows[i][0] };
+        if (req.regen_password === true) {
+          var pw = genPassword_();
+          var pcell = sh.getRange(i + 1, 2);
+          pcell.setNumberFormat('@');
+          pcell.setValue(pw);
+          out.password = pw;
+        }
+        return out;
       }
     }
     return { error: 'name_not_found' };
