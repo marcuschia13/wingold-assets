@@ -30,6 +30,13 @@ var STATUS_LABELS = {
 
 function ss_() { return SpreadsheetApp.openById(PROPS.getProperty('SHEET_ID')); }
 
+// Sheets coerces appended "yyyy-MM-dd" strings into Date cells — normalize on read
+// (engine gotcha; same fix as the lucky-draw backends).
+function dayOf_(v) {
+  if (v instanceof Date) return Utilities.formatDate(v, TZ, 'yyyy-MM-dd');
+  return String(v).slice(0, 10);
+}
+
 function json_(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
@@ -266,7 +273,7 @@ function undo_(req) {
     var voided = {};
     for (var i = rows.length - 1; i >= 1; i--) {
       var r = rows[i];
-      if (String(r[1]) !== today || String(r[3]) !== name) continue;
+      if (dayOf_(r[1]) !== today || String(r[3]) !== name) continue;
       var action = String(r[4]);
       var key = r[5] + '|' + Math.abs(parseFloat(r[7]) || 0);
       if (action.indexOf('VOID') === 0) { voided[key] = (voided[key] || 0) + 1; continue; }
@@ -312,7 +319,7 @@ function standing_(name, outlet, target) {
     var today = fmt_(d, 'yyyy-MM-dd');
     for (var i = 1; i < rows.length; i++) {
       var r = rows[i];
-      if (String(r[1]) !== today) continue;
+      if (dayOf_(r[1]) !== today) continue;
       var action = String(r[4]);
       var qty = parseFloat(r[7]) || 0;
       var rm = parseFloat(r[9]) || 0;
