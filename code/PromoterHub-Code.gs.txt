@@ -192,6 +192,30 @@ function seenRequest_(reqId) {
   return false;
 }
 
+// ---------------------------------------------------------------- photos
+
+// Photos land in Drive: "Promoter Hub Photos"/<outlet>/<yyyy-MM-dd>/<name>-<kind>-<HHmmss>.jpg
+// (root folder auto-created in lotspace.my's Drive on first use).
+function photoRoot_() {
+  var it = DriveApp.getFoldersByName('Promoter Hub Photos');
+  return it.hasNext() ? it.next() : DriveApp.createFolder('Promoter Hub Photos');
+}
+
+function subFolder_(parent, name) {
+  var it = parent.getFoldersByName(name);
+  return it.hasNext() ? it.next() : parent.createFolder(name);
+}
+
+function savePhoto_(outlet, name, kind, b64, d) {
+  var day = subFolder_(subFolder_(photoRoot_(), outlet), fmt_(d, 'yyyy-MM-dd'));
+  var blob = Utilities.newBlob(Utilities.base64Decode(b64), 'image/jpeg',
+      name + ' - ' + kind + ' - ' + fmt_(d, 'HHmmss') + '.jpg');
+  return day.createFile(blob).getUrl();
+}
+
+var CHECKIN_PHOTOS = [['selfie', 'SELFIE IN'], ['rack', 'RACK IN']];
+var CHECKOUT_PHOTOS = [['selfie', 'SELFIE OUT'], ['rack', 'RACK OUT']];
+
 // ---------------------------------------------------------------- event writes
 
 function row_(d, name, action, code, item, qty, price, rm) {
@@ -205,12 +229,37 @@ function clock_(req, label) {
   var name = String(req.name || '').trim();
   var outlet = String(req.outlet || '').trim();
   if (!name || !outlet) return { error: 'missing_fields' };
+
+  // Mandatory photo evidence (Marcus 2026-07-05): check-in = selfie + whole rack +
+  // >=1 price-tag photo; check-out = selfie + whole rack.
+  var photos = req.photos || {};
+  var need = label === 'CHECK IN' ? CHECKIN_PHOTOS : CHECKOUT_PHOTOS;
+  for (var n = 0; n < need.length; n++) {
+    if (!photos[need[n][0]]) return { error: 'photos_required', missing: need[n][0] };
+  }
+  var tags = photos.tags || [];
+  if (label === 'CHECK IN' && (!tags.length || tags.length > 20)) {
+    return { error: 'photos_required', missing: 'tags' };
+  }
+
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(10000)) return { error: 'busy', retry: true };
   try {
     if (seenRequest_(String(req.request_id || ''))) return { ok: true, replay: true };
     var d = now_();
-    tab_(outlet, d).appendRow(row_(d, name, label));
+    var sh = tab_(outlet, d);
+    var suffix = label === 'CHECK IN' ? 'IN' : 'OUT';
+    need.forEach(function (spec) {
+      var url = savePhoto_(outlet, name, spec[1], photos[spec[0]], d);
+      sh.appendRow(row_(d, name, 'PHOTO — ' + spec[1], spec[1].split(' ')[0], url));
+    });
+    if (label === 'CHECK IN') {
+      for (var t = 0; t < tags.length; t++) {
+        var turl = savePhoto_(outlet, name, 'PRICE TAGS ' + (t + 1), tags[t], d);
+        sh.appendRow(row_(d, name, 'PHOTO — PRICE TAGS', 'TAGS' + (t + 1), turl));
+      }
+    }
+    sh.appendRow(row_(d, name, label));
     var out = { ok: true, time: fmt_(d, 'HH:mm') };
     if (label === 'CHECK OUT') out.standing = standing_(name, outlet, req.target);
     return out;
