@@ -204,9 +204,11 @@ function photoRoot_() {
 
 // ONE-TIME AUTHORIZATION HELPER — run me from the editor (Run → Allow) to grant the
 // Drive scope. Exists because names ending in "_" are hidden from the Run dropdown.
+// Creates today's day-folder = a real WRITE, so a partial (read-only) grant fails
+// loudly here instead of silently passing (granular consent bit us on 2026-07-07).
 function authorizePhotos() {
-  var f = photoRoot_();
-  Logger.log('Drive OK — photos folder ready: ' + f.getUrl());
+  var day = subFolder_(photoRoot_(), fmt_(now_(), 'yyyy-MM-dd'));
+  Logger.log('Drive WRITE OK — today\'s photo folder ready: ' + day.getUrl());
 }
 
 function subFolder_(parent, name) {
