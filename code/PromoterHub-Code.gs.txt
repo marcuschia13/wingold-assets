@@ -99,6 +99,7 @@ function doPost(e) {
       case 'checkin':  return json_(clock_(req, 'CHECK IN'));
       case 'checkout': return json_(clock_(req, 'CHECK OUT'));
       case 'sale':     return json_(sale_(req));
+      case 'task_photos': return json_(taskPhotos_(req));
       case 'undo':     return json_(undo_(req));
       case 'status':   return json_(status_(req));
       case 'standing': return json_(standing_(req.name, req.outlet, req.target));
@@ -238,7 +239,7 @@ function clock_(req, label) {
     if (!photos[need[n][0]]) return { error: 'photos_required', missing: need[n][0] };
   }
   var tags = photos.tags || [];
-  if (label === 'CHECK IN' && (!tags.length || tags.length > 20)) {
+  if (label === 'CHECK IN' && (!tags.length || tags.length > 30)) {
     return { error: 'photos_required', missing: 'tags' };
   }
 
@@ -263,6 +264,34 @@ function clock_(req, label) {
     var out = { ok: true, time: fmt_(d, 'HH:mm') };
     if (label === 'CHECK OUT') out.standing = standing_(name, outlet, req.target);
     return out;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// 2pm sampling-photo task (Marcus 2026-07-07): around 2pm every promoter must send
+// 3 photos of the sampling in action. The app nags from 14:00 until submitted;
+// photos land in Drive like clock photos and are logged as PHOTO — SAMPLING rows
+// (standing_/leaderboard_ read those rows back as the "done" flag).
+function taskPhotos_(req) {
+  var name = String(req.name || '').trim();
+  var outlet = String(req.outlet || '').trim();
+  if (!name || !outlet) return { error: 'missing_fields' };
+  var shots = (req.photos && req.photos.shots) || [];
+  if (shots.length < 3) return { error: 'photos_required', missing: 'need 3 photos' };
+  if (shots.length > 6) return { error: 'photos_required', missing: 'max 6 photos' };
+
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return { error: 'busy', retry: true };
+  try {
+    if (seenRequest_(String(req.request_id || ''))) return { ok: true, replay: true };
+    var d = now_();
+    var sh = tab_(outlet, d);
+    for (var i = 0; i < shots.length; i++) {
+      var url = savePhoto_(outlet, name, 'SAMPLING 2PM ' + (i + 1), shots[i], d);
+      sh.appendRow(row_(d, name, 'PHOTO — SAMPLING', 'SAMPLING' + (i + 1), url));
+    }
+    return { ok: true, time: fmt_(d, 'HH:mm'), count: shots.length };
   } finally {
     lock.releaseLock();
   }
@@ -369,7 +398,7 @@ function status_(req) {
 function standing_(name, outlet, target) {
   var d = now_();
   var sh = ss_().getSheetByName(tabName_(outlet, d));
-  var me = 0, out = 0, meRm = 0, samples = 0;
+  var me = 0, out = 0, meRm = 0, samples = 0, photosDone = false;
   if (sh) {
     var rows = sh.getDataRange().getValues();
     var today = fmt_(d, 'yyyy-MM-dd');
@@ -384,11 +413,14 @@ function standing_(name, outlet, target) {
         if (String(r[3]) === name) { me += qty; meRm += rm; }
       } else if (action === 'SAMPLE' && String(r[3]) === name) {
         samples += qty;
+      } else if (action === 'PHOTO — SAMPLING' && String(r[3]) === name) {
+        photosDone = true;
       }
     }
   }
   return { ok: true, me_packs: me, outlet_packs: out, me_rm: Math.round(meRm * 100) / 100,
-           me_samples: samples, target: parseInt(target, 10) || 50 };
+           me_samples: samples, photos_done: photosDone,
+           target: parseInt(target, 10) || 50 };
 }
 
 
@@ -423,7 +455,8 @@ function leaderboard_(req) {
         packs += q; rm += m; p.packs += q; p.rm += m;
       } else if (action === 'SAMPLE') {
         samples += parseFloat(r[7]) || 0; p.samples += parseFloat(r[7]) || 0;
-      } else if (action === 'CHECK IN') p.state = '🟢 in';
+      } else if (action === 'PHOTO — SAMPLING') p.photos = true;
+      else if (action === 'CHECK IN') p.state = '🟢 in';
       else if (action === 'CHECK OUT') p.state = '🔵 done';
       else if (action.indexOf('— OUT') > 0) p.state = '🟡 break';
       else if (action.indexOf('— BACK') > 0) p.state = '🟢 in';
