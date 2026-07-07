@@ -195,11 +195,18 @@ function seenRequest_(reqId) {
 
 // ---------------------------------------------------------------- photos
 
-// Photos land in Drive: "Promoter Hub Photos"/<outlet>/<yyyy-MM-dd>/<name>-<kind>-<HHmmss>.jpg
-// (root folder auto-created in lotspace.my's Drive on first use).
+// Photos land in Drive: "Promoter Hub Photos"/<yyyy-MM-dd>/<outlet>/<name>-<kind>-<HHmmss>.jpg
+// (1 day = 1 folder, outlets inside — Marcus 2026-07-07; root auto-created on first use).
 function photoRoot_() {
   var it = DriveApp.getFoldersByName('Promoter Hub Photos');
   return it.hasNext() ? it.next() : DriveApp.createFolder('Promoter Hub Photos');
+}
+
+// ONE-TIME AUTHORIZATION HELPER — run me from the editor (Run → Allow) to grant the
+// Drive scope. Exists because names ending in "_" are hidden from the Run dropdown.
+function authorizePhotos() {
+  var f = photoRoot_();
+  Logger.log('Drive OK — photos folder ready: ' + f.getUrl());
 }
 
 function subFolder_(parent, name) {
@@ -208,7 +215,7 @@ function subFolder_(parent, name) {
 }
 
 function savePhoto_(outlet, name, kind, b64, d) {
-  var day = subFolder_(subFolder_(photoRoot_(), outlet), fmt_(d, 'yyyy-MM-dd'));
+  var day = subFolder_(subFolder_(photoRoot_(), fmt_(d, 'yyyy-MM-dd')), outlet);
   var blob = Utilities.newBlob(Utilities.base64Decode(b64), 'image/jpeg',
       name + ' - ' + kind + ' - ' + fmt_(d, 'HHmmss') + '.jpg');
   return day.createFile(blob).getUrl();
