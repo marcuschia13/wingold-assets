@@ -27,6 +27,8 @@ var STATUS_LABELS = {
   'toilet_out': 'TOILET — OUT', 'toilet_in': 'TOILET — BACK',
   'surau_out': 'SURAU — OUT (prayer)', 'surau_in': 'SURAU — BACK'
 };
+// Bump on each deploy so cached period reports (up to 6h TTL) don't serve stale data.
+var CACHE_V = 'v9';
 
 function ss_() { return SpreadsheetApp.openById(PROPS.getProperty('SHEET_ID')); }
 
@@ -108,6 +110,9 @@ function doPost(e) {
       case 'addUser':   return json_(addUser_(req));
       case 'setUser':   return json_(setUser_(req));
       case 'setPrice':  return json_(setPrice_(req));
+      case 'get_pricing':     return json_(getPricing_(req));
+      case 'submit_pricing':  return json_(submitPricing_(req));
+      case 'confirm_pricing': return json_(confirmPricing_(req));
       default:         return json_({ error: 'unknown action' });
     }
   } catch (err) {
@@ -505,8 +510,24 @@ function getAdmin_(req) {
     if (prow[j][0]) prices.push({ outlet: String(prow[j][0]), brand: String(prow[j][1]),
                                   code: String(prow[j][2]), price: parseFloat(prow[j][3]) });
   }
+  // monthly price/promo submissions: everything this month + any straggler PENDING
+  var srows = pricingSheet_().getDataRange().getValues();
+  var month = monthKey_();
+  var pricing = [];
+  for (var k = 1; k < srows.length; k++) {
+    var st = String(srows[k][5]).toUpperCase();
+    if (monthOf_(srows[k][0]) !== month && st !== 'PENDING') continue;
+    var entry = { month: monthOf_(srows[k][0]), outlet: String(srows[k][1]),
+                  brand: String(srows[k][2]), promoter: String(srows[k][3]),
+                  submitted: tsOf_(srows[k][4]), status: st.toLowerCase(),
+                  reviewed: tsOf_(srows[k][8] || '') };
+    try { entry.prices = JSON.parse(srows[k][6] || '{}'); } catch (e) { entry.prices = {}; }
+    try { entry.promo = JSON.parse(srows[k][7] || 'null'); } catch (e) { entry.promo = null; }
+    pricing.push(entry);
+  }
   var c = config_();
-  return { ok: true, roster: roster, prices: prices, brands: c.brands, outlets: c.outlets };
+  return { ok: true, roster: roster, prices: prices, pricing: pricing,
+           brands: c.brands, outlets: c.outlets };
 }
 
 function addUser_(req) {
@@ -578,18 +599,200 @@ function setPrice_(req) {
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(10000)) return { error: 'busy', retry: true };
   try {
-    var sh = ss_().getSheetByName('App Prices');
-    var rows = sh.getDataRange().getValues();
-    for (var i = 1; i < rows.length; i++) {
-      if (String(rows[i][0]) === outlet && String(rows[i][1]) === brand &&
-          String(rows[i][2]).toUpperCase() === code) {
-        if (clear) sh.deleteRow(i + 1);
-        else sh.getRange(i + 1, 4).setValue(price);
-        return { ok: true };
+    upsertPrice_(outlet, brand, code, clear ? '' : price);
+    return { ok: true };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// Upsert one live price override; price = '' deletes the row. Callers hold the lock.
+function upsertPrice_(outlet, brand, code, price) {
+  var sh = ss_().getSheetByName('App Prices');
+  var rows = sh.getDataRange().getValues();
+  for (var i = 1; i < rows.length; i++) {
+    if (String(rows[i][0]) === outlet && String(rows[i][1]) === brand &&
+        String(rows[i][2]).toUpperCase() === code) {
+      if (price === '') sh.deleteRow(i + 1);
+      else sh.getRange(i + 1, 4).setValue(price);
+      return;
+    }
+  }
+  if (price !== '') sh.appendRow([outlet, brand, code, price]);
+}
+
+// ------------------------------------------- monthly price & promo submissions
+// Marcus 2026-07-08: the promoter keys in their outlet's shelf prices + the month's
+// promotion in the Hub (once a month); a leader confirms in the dashboard. Only a
+// CONFIRMED submission touches the live 'App Prices' store that priceFor_ reads.
+// One submission per (month, outlet, brand); resubmitting overwrites it → PENDING.
+
+var PRICING_HEADERS = ['Month', 'Outlet', 'Brand', 'Promoter', 'Submitted',
+                       'Status', 'Prices', 'Promo', 'Reviewed'];
+
+function pricingSheet_() {
+  var ss = ss_();
+  var sh = ss.getSheetByName('App Price Submissions');
+  if (!sh) {
+    sh = ss.insertSheet('App Price Submissions');
+    sh.getRange(1, 1, 1, PRICING_HEADERS.length).setValues([PRICING_HEADERS]);
+  }
+  return sh;
+}
+
+function monthKey_() { return fmt_(now_(), 'yyyy-MM'); }
+
+// Same Sheets date-coercion gotcha as dayOf_ — '2026-07' can come back as a Date.
+function monthOf_(v) {
+  if (v instanceof Date) return Utilities.formatDate(v, TZ, 'yyyy-MM');
+  return String(v).slice(0, 7);
+}
+
+function tsOf_(v) {
+  if (v instanceof Date) return Utilities.formatDate(v, TZ, 'yyyy-MM-dd HH:mm');
+  return String(v);
+}
+
+function pricingRowIdx_(rows, month, outlet, brand) {
+  for (var i = rows.length - 1; i >= 1; i--) {
+    if (monthOf_(rows[i][0]) === month && String(rows[i][1]) === outlet &&
+        String(rows[i][2]) === brand) return i;
+  }
+  return -1;
+}
+
+// Promo template: buy-N-at-RM deals for the three series + the free-gift lines.
+// Incomplete lines are dropped; free text is capped. Returns null if empty.
+function cleanPromo_(p) {
+  if (!p || typeof p !== 'object') return null;
+  var out = { gift: p.gift === true };
+  var any = false;
+  ['batik', 'bunny', 'cikpija'].forEach(function (k) {
+    var d = p[k] || {};
+    var qty = parseInt(d.qty, 10);
+    var rm = Math.round(parseFloat(d.price) * 100) / 100;
+    if (qty > 0 && qty <= 99 && rm > 0 && rm <= 999) {
+      out[k] = { qty: qty, price: rm };
+      any = true;
+    }
+  });
+  ['gift_spacelab', 'gift_cikpija'].forEach(function (k) {
+    var g = p[k] || {};
+    var rm = Math.round(parseFloat(g.rm) * 100) / 100;
+    var item = String(g.item || '').trim().slice(0, 80);
+    if (out.gift && rm > 0 && rm <= 9999 && item) {
+      out[k] = { rm: rm, item: item };
+      any = true;
+    }
+  });
+  return any || out.gift ? out : null;
+}
+
+// Promoter view: this month's submission state for my outlet+brand.
+// status: none / pending / confirmed / rejected. Prefills the form: prices from my
+// submission (else the live overrides), promo from the outlet's latest this month.
+function getPricing_(req) {
+  var name = String(req.name || '').trim();
+  var outlet = String(req.outlet || '').trim();
+  var brand = String(req.brand || '').trim();
+  if (!name || !outlet || !brand) return { error: 'missing_fields' };
+  var month = monthKey_();
+  var rows = pricingSheet_().getDataRange().getValues();
+  var out = { ok: true, month: month, status: 'none', prices: {}, promo: null };
+  var i = pricingRowIdx_(rows, month, outlet, brand);
+  if (i >= 0) {
+    out.status = String(rows[i][5]).toLowerCase();
+    out.submitted_by = String(rows[i][3]);
+    try { out.prices = JSON.parse(rows[i][6] || '{}'); } catch (e) {}
+    try { out.promo = JSON.parse(rows[i][7] || 'null'); } catch (e) {}
+    return out;
+  }
+  try {
+    var prow = ss_().getSheetByName('App Prices').getDataRange().getValues();
+    for (var j = 1; j < prow.length; j++) {
+      if (String(prow[j][0]) === outlet && String(prow[j][1]) === brand) {
+        var v = parseFloat(prow[j][3]);
+        if (v > 0) out.prices[String(prow[j][2]).toUpperCase()] = v;
       }
     }
-    if (!clear) sh.appendRow([outlet, brand, code, price]);
-    return { ok: true };
+  } catch (e) {}
+  for (var k = rows.length - 1; k >= 1; k--) {
+    if (monthOf_(rows[k][0]) === month && String(rows[k][1]) === outlet && rows[k][7]) {
+      try { out.promo = JSON.parse(rows[k][7]); } catch (e) {}
+      break;
+    }
+  }
+  return out;
+}
+
+function submitPricing_(req) {
+  var name = String(req.name || '').trim();
+  var outlet = String(req.outlet || '').trim();
+  var brand = String(req.brand || '').trim();
+  if (!name || !outlet || !brand) return { error: 'missing_fields' };
+  var cfg = config_();
+  var brandCfg = cfg.brands[brand];
+  if (!brandCfg) return { error: 'brand_invalid' };
+  var raw = req.prices || {};
+  var prices = {};
+  for (var code in raw) {
+    var c = String(code).toUpperCase();
+    if (!brandCfg.items[c]) return { error: 'code_invalid: ' + c };
+    var v = Math.round(parseFloat(raw[code]) * 100) / 100;
+    if (!(v > 0) || v > 999) return { error: 'price_invalid: ' + c };
+    prices[c] = v;
+  }
+  var promo = cleanPromo_(req.promo);
+  if (!Object.keys(prices).length && !promo) return { error: 'nothing_to_submit' };
+
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return { error: 'busy', retry: true };
+  try {
+    if (seenRequest_(String(req.request_id || ''))) {
+      return { ok: true, replay: true, status: 'pending' };
+    }
+    var sh = pricingSheet_();
+    var rows = sh.getDataRange().getValues();
+    var month = monthKey_();
+    var row = [month, outlet, brand, name, fmt_(now_(), 'yyyy-MM-dd HH:mm'), 'PENDING',
+               JSON.stringify(prices), promo ? JSON.stringify(promo) : '', ''];
+    var i = pricingRowIdx_(rows, month, outlet, brand);
+    if (i >= 0) sh.getRange(i + 1, 1, 1, row.length).setValues([row]);
+    else sh.appendRow(row);
+    return { ok: true, status: 'pending' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// Leader confirms (approve !== false) or rejects a submission. Confirming applies
+// every submitted price into 'App Prices' — the store sales read at sale time.
+function confirmPricing_(req) {
+  if (!checkPin_(req)) return { error: 'bad_pin' };
+  var outlet = String(req.outlet || '').trim();
+  var brand = String(req.brand || '').trim();
+  var month = String(req.month || '').trim() || monthKey_();
+  if (!outlet || !brand) return { error: 'missing_fields' };
+  var approve = req.approve !== false;
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return { error: 'busy', retry: true };
+  try {
+    var sh = pricingSheet_();
+    var rows = sh.getDataRange().getValues();
+    var i = pricingRowIdx_(rows, month, outlet, brand);
+    if (i < 0) return { error: 'not_found' };
+    var applied = 0;
+    if (approve) {
+      var prices = {};
+      try { prices = JSON.parse(rows[i][6] || '{}'); } catch (e) {}
+      for (var code in prices) {
+        upsertPrice_(outlet, brand, String(code).toUpperCase(), prices[code]);
+        applied++;
+      }
+    }
+    sh.getRange(i + 1, 6).setValue(approve ? 'CONFIRMED' : 'REJECTED');
+    sh.getRange(i + 1, 9).setValue(fmt_(now_(), 'yyyy-MM-dd HH:mm'));
+    return { ok: true, applied: applied, status: approve ? 'confirmed' : 'rejected' };
   } finally {
     lock.releaseLock();
   }
